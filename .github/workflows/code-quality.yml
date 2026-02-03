@@ -1,0 +1,444 @@
+name: Python Code Quality Checker
+
+on:
+  pull_request:
+    branches: [ main, dev ]
+  push:
+    branches: [ main, dev, demo ]
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+  security-events: write
+
+concurrency:
+  group: python-quality-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  QUALITY_THRESHOLD: "80"        
+  FAIL_ON_GITLEAKS: "true"      
+  FAIL_ON_SYNTAX_ERROR: "true"   
+  CHECKOV_HIGH_WEIGHT: "8"
+  CHECKOV_MED_WEIGHT: "3"
+
+jobs:
+  python_quality:
+    name: Python – lint, types, security, complexity (collect outputs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            flake8 flake8-bugbear flake8-builtins pep8-naming flake8-blind-except flake8-json \
+            mypy bandit radon
+
+      - name: Prepare outputs dir
+        run: mkdir -p outputs
+
+      - name: Syntax check (compile) → outputs/syntax.json
+        shell: bash
+        run: |
+          set +e
+          pyfiles=$(git ls-files '*.py' || true)
+          if [ -n "$pyfiles" ]; then
+            python -m py_compile $pyfiles
+            status=$?
+            if [ $status -eq 0 ]; then
+              echo '{"passed": true}' > outputs/syntax.json
+            else
+              echo '{"passed": false}' > outputs/syntax.json
+            fi
+          else
+            echo '{"passed": true, "note":"No Python files detected"}' > outputs/syntax.json
+          fi
+
+      - name: Flake8 (style, naming, exceptions) → outputs/flake8.json
+        run: |
+          flake8 . --format=json --tee --output-file outputs/flake8.json || true
+
+      - name: Mypy (types) → outputs/mypy.json
+        run: |
+          mypy --install-types --non-interactive --error-format=json . > outputs/mypy.json || true
+
+      - name: Bandit (security) → outputs/bandit.json
+        run: |
+          bandit -r . -q -x tests -f json -o outputs/bandit.json || true
+
+      - name: Radon (complexity JSON) → outputs/radon_cc.json
+        run: |
+          radon cc . -j > outputs/radon_cc.json || true
+
+      - name: Upload Python outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: python_outputs
+          path: outputs
+
+  secrets_scan:
+    name: Secret scanning (Gitleaks) → outputs/gitleaks.json
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare outputs dir
+        run: mkdir -p outputs
+
+      - name: Run Gitleaks (JSON report)
+        id: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        with:
+          args: --redact -v --report-format json --report-path outputs/gitleaks.json
+
+      - name: Upload Gitleaks outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: secrets_outputs
+          path: outputs
+
+  checkov:
+    name: IaC security (Checkov) → outputs/checkov.json + SARIF
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare outputs dir
+        run: mkdir -p outputs
+
+      - name: Run Checkov
+        id: checkov
+        uses: bridgecrewio/checkov-action@v12
+        continue-on-error: true
+        with:
+          directory: .
+          quiet: true
+          framework: terraform,cloudformation,kubernetes,arm,helm,serverless
+          soft_fail: false
+          output_format: sarif,json
+          # this produces outputs/checkov.sarif and outputs/checkov.json
+          output_file_path: outputs/checkov
+
+      - name: Upload SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: outputs/checkov.sarif
+
+      - name: Upload Checkov outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkov_outputs
+          path: outputs
+
+  aggregate_score:
+    name: Aggregate → single JSON + Markdown, score & notify
+    runs-on: ubuntu-latest
+    needs: [python_quality, secrets_scan, checkov]
+    steps:
+      - name: Download Python outputs
+        uses: actions/download-artifact@v4
+        with:
+          name: python_outputs
+          path: artifacts/python
+
+      - name: Download Gitleaks outputs
+        uses: actions/download-artifact@v4
+        with:
+          name: secrets_outputs
+          path: artifacts/secrets
+
+      - name: Download Checkov outputs
+        uses: actions/download-artifact@v4
+        with:
+          name: checkov_outputs
+          path: artifacts/checkov
+
+      - name: Aggregate & score
+        id: score
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, sys, glob, re
+          from pathlib import Path
+
+          threshold = int(os.getenv("QUALITY_THRESHOLD", "80"))
+          fail_on_gitleaks = os.getenv("FAIL_ON_GITLEAKS","true").lower()=="true"
+          fail_on_syntax = os.getenv("FAIL_ON_SYNTAX_ERROR","true").lower()=="true"
+          chk_high_w = float(os.getenv("CHECKOV_HIGH_WEIGHT","8"))
+          chk_med_w = float(os.getenv("CHECKOV_MED_WEIGHT","3"))
+
+          def read_json(path):
+            try:
+              with open(path, "r", encoding="utf-8") as f:
+                txt = f.read().strip()
+                if not txt:
+                  return None
+                return json.loads(txt)
+            except Exception:
+              return None
+
+          def first_match(patterns):
+            for pat in patterns:
+              m = glob.glob(pat, recursive=True)
+              if m:
+                return Path(m[0])
+            return None
+
+          out_dir = Path("outputs")
+          out_dir.mkdir(exist_ok=True, parents=True)
+
+          # Locate files
+          flake8_p = first_match(["artifacts/python/**/flake8.json"])
+          mypy_p = first_match(["artifacts/python/**/mypy.json"])
+          bandit_p = first_match(["artifacts/python/**/bandit.json"])
+          radon_p = first_match(["artifacts/python/**/radon_cc.json"])
+          syntax_p = first_match(["artifacts/python/**/syntax.json"])
+          gitleaks_p = first_match(["artifacts/secrets/**/gitleaks.json"])
+          checkov_p = first_match(["artifacts/checkov/**/checkov.json","artifacts/checkov/**/checkov*.json"])
+
+          # Parse counts
+          flake8_issues = 0
+          if flake8_p:
+            fj = read_json(flake8_p)
+            if isinstance(fj, dict):
+              # flake8-json → { "path/to/file.py": [ {...}, ... ], ... }
+              flake8_issues = sum(len(v or []) for v in fj.values())
+
+          mypy_errors = 0
+          if mypy_p:
+            mj = read_json(mypy_p)
+            if isinstance(mj, dict):
+              # common formats:
+              #  - {"messages":[{"severity":"error",...},...], ...}
+              #  - {"errors": N, ...}
+              if "messages" in mj and isinstance(mj["messages"], list):
+                mypy_errors = sum(1 for m in mj["messages"] if str(m.get("severity","")).lower()=="error" or "message" in m)
+              elif "errors" in mj and isinstance(mj["errors"], int):
+                mypy_errors = mj["errors"]
+            elif isinstance(mj, list):
+              mypy_errors = len(mj)
+
+          bandit_high = bandit_med = 0
+          if bandit_p:
+            bj = read_json(bandit_p)
+            if isinstance(bj, dict) and isinstance(bj.get("results"), list):
+              for r in bj["results"]:
+                sev = str(r.get("issue_severity","")).upper()
+                if sev == "HIGH":
+                  bandit_high += 1
+                elif sev == "MEDIUM":
+                  bandit_med += 1
+
+          radon_viol = 0
+          max_cc = 0
+          if radon_p:
+            rj = read_json(radon_p) or {}
+            if isinstance(rj, dict):
+              for entries in rj.values():
+                for e in entries or []:
+                  c = int(e.get("complexity", 0))
+                  if c > 15:
+                    radon_viol += 1
+                  if c > max_cc:
+                    max_cc = c
+
+          syntax_passed = True
+          if syntax_p:
+            sj = read_json(syntax_p) or {}
+            syntax_passed = bool(sj.get("passed", True))
+
+          gitleaks_count = 0
+          if gitleaks_p:
+            gj = read_json(gitleaks_p)
+            if isinstance(gj, list):
+              gitleaks_count = len(gj)
+            elif isinstance(gj, dict):
+              # try a couple common fields
+              if isinstance(gj.get("findings"), list):
+                gitleaks_count = len(gj["findings"])
+              elif isinstance(gj.get("Leaks"), list):
+                gitleaks_count = len(gj["Leaks"])
+
+          chk_high = chk_med = 0
+          if checkov_p:
+            cj = read_json(checkov_p)
+            # Checkov json often has "results" -> "failed_checks": [{"severity":"HIGH"/"MEDIUM"/...}, ...]
+            if isinstance(cj, dict):
+              res = cj.get("results") or {}
+              failed = res.get("failed_checks") or []
+              if isinstance(failed, list):
+                for fc in failed:
+                  sev = str(fc.get("severity","")).upper()
+                  if sev == "HIGH":
+                    chk_high += 1
+                  elif sev == "MEDIUM":
+                    chk_med += 1
+
+          # Scoring model (100 max)
+          score = 100.0
+
+          # Hard failures
+          hard_fail_reasons = []
+          if not syntax_passed and fail_on_syntax:
+            hard_fail_reasons.append("Syntax compile failed")
+          if gitleaks_count > 0 and fail_on_gitleaks:
+            hard_fail_reasons.append(f"Gitleaks found {gitleaks_count} secret leak(s)")
+
+          # Deduct points (caps keep any single tool from dominating)
+          score -= min(30.0, 0.5 * flake8_issues)         # style
+          score -= min(30.0, 1.0 * mypy_errors)           # typing
+          score -= min(30.0, 10.0 * bandit_high + 5.0 * bandit_med)  # python security
+          score -= min(20.0, 5.0 * radon_viol)            # complexity
+          score -= min(30.0, chk_high_w * chk_high + chk_med_w * chk_med)  # IaC security
+
+          # If syntax/gitleaks hard fail is enabled, zero out score (for clarity)
+          if hard_fail_reasons:
+            score = max(0.0, score)  # keep non-negative
+          
+          # Make it tidy
+          score = round(score, 2)
+          passed = (not hard_fail_reasons) and score >= threshold
+
+          summary = {
+            "threshold": threshold,
+            "score": score,
+            "passed": passed,
+            "hard_fail_reasons": hard_fail_reasons,
+            "metrics": {
+              "flake8_issues": flake8_issues,
+              "mypy_errors": mypy_errors,
+              "bandit_high": bandit_high,
+              "bandit_med": bandit_med,
+              "radon_violations_over_15": radon_viol,
+              "radon_max_complexity": max_cc,
+              "gitleaks_findings": gitleaks_count,
+              "checkov_high": chk_high,
+              "checkov_medium": chk_med
+            },
+            "files": {
+              "flake8": str(flake8_p) if flake8_p else None,
+              "mypy": str(mypy_p) if mypy_p else None,
+              "bandit": str(bandit_p) if bandit_p else None,
+              "radon_cc": str(radon_p) if radon_p else None,
+              "syntax": str(syntax_p) if syntax_p else None,
+              "gitleaks": str(gitleaks_p) if gitleaks_p else None,
+              "checkov": str(checkov_p) if checkov_p else None
+            }
+          }
+
+          Path("outputs").mkdir(parents=True, exist_ok=True)
+          Path("outputs/quality_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          # Markdown summary
+          lines = []
+          lines.append(f"# Code Quality Summary")
+          lines.append("")
+          if summary["passed"]:
+            lines.append(f"**✅ PASSED** — Score: **{score}** / {threshold} required")
+          else:
+            lines.append(f"**❌ FAILED** — Score: **{score}** / {threshold} required")
+          if hard_fail_reasons:
+            lines.append("")
+            lines.append("**Hard fail reasons:**")
+            for r in hard_fail_reasons:
+              lines.append(f"- {r}")
+          lines.append("")
+          lines.append("## Metrics")
+          m = summary["metrics"]
+          lines.append(f"- Flake8 issues: **{m['flake8_issues']}**")
+          lines.append(f"- Mypy errors: **{m['mypy_errors']}**")
+          lines.append(f"- Bandit: **{m['bandit_high']} HIGH**, **{m['bandit_med']} MEDIUM**")
+          lines.append(f"- Radon: **{m['radon_violations_over_15']}** functions/methods over CC>15 (max CC: {m['radon_max_complexity']})")
+          lines.append(f"- Gitleaks findings: **{m['gitleaks_findings']}**")
+          lines.append(f"- Checkov: **{m['checkov_high']} HIGH**, **{m['checkov_medium']} MEDIUM**")
+          lines.append("")
+          lines.append("> See run artifacts for detailed JSON reports (flake8, mypy, bandit, radon, gitleaks, checkov) and SARIF in code scanning.")
+
+          Path("outputs/quality_summary.md").write_text("\n".join(lines), encoding="utf-8")
+
+          print("::group::Quality Summary")
+          print("\n".join(lines))
+          print("::endgroup::")
+
+          # Expose outputs for subsequent steps
+          gh_out = Path(os.environ["GITHUB_OUTPUT"])
+          gh_out.write_text(
+            "\n".join([
+              f"score={score}",
+              f"threshold={threshold}",
+              f"passed={'true' if summary['passed'] else 'false'}"
+            ]),
+            encoding="utf-8"
+          )
+          PY
+
+      - name: Upload aggregated summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality_summary
+          path: outputs
+
+      - name: Attach summary to job
+        run: cat outputs/quality_summary.md >> $GITHUB_STEP_SUMMARY
+
+      # PR failure → request changes and notify reviewers via a review comment
+      - name: PR review (request changes on failure)
+        if: ${{ github.event_name == 'pull_request' && steps.score.outputs.passed == 'false' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const md = fs.readFileSync('outputs/quality_summary.md', 'utf8');
+            const number = context.payload.pull_request.number;
+            // Attempt to mention reviewers (will notify in GH)
+            const reviewers = (context.payload.pull_request.requested_reviewers || []).map(r => '@' + r.login);
+            const body = (reviewers.length ? reviewers.join(' ') + '\n\n' : '') + md;
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: number,
+              event: 'REQUEST_CHANGES',
+              body
+            });
+
+      # Push failure → email the commit author (if email available and SMTP secrets configured)
+      - name: Send failure email to commit author (push only)
+        if: ${{ github.event_name == 'push' && steps.score.outputs.passed == 'false' && github.event.head_commit.author.email != '' && !contains(github.event.head_commit.author.email, 'noreply') }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "[${{ github.repository }}] Code Quality FAILED (score ${{ steps.score.outputs.score }}) on ${{ github.ref_name }}"
+          to: ${{ github.event.head_commit.author.email }}
+          from: ${{ secrets.SMTP_FROM }}
+          content_type: text/html
+          html_body: |
+            <p>Hi,</p>
+            <p>Your recent push to <b>${{ github.ref_name }}</b> failed the code quality gate.</p>
+            <p><b>Score:</b> ${{ steps.score.outputs.score }} (required: ${{ steps.score.outputs.threshold }})</p>
+            <p>See full report in the workflow run artifacts (quality_summary) and the job summary.</p>
+            <p>Repository: <a href="https://github.com/${{epository }}{{ github.repository }}</a></p>
+
+      # Finally, fail the job if gate not met
+      - name: Fail if below threshold
+        if: ${{ steps.score.outputs.passed == 'false' }}
+        run: |
+          echo "Quality score ${{ steps.score.outputs.score }} is below threshold ${{ steps.score.outputs.threshold }}."
+          exit 1
