@@ -434,7 +434,7 @@ jobs:
             <p>Your recent push to <b>${{ github.ref_name }}</b> failed the code quality gate.</p>
             <p><b>Score:</b> ${{ steps.score.outputs.score }} (required: ${{ steps.score.outputs.threshold }})</p>
             <p>See full report in the workflow run artifacts (quality_summary) and the job summary.</p>
-            <p>Repository: <a href="https://github.com/${{epository }}{{ github.repository }}</a></p>
+            <p>Repository: <a href="https://github.com/${{repository }}{{ github.repository }}</a></p>
 
       # Finally, fail the job if gate not met
       - name: Fail if below threshold
