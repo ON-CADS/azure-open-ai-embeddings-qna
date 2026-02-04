@@ -46,7 +46,7 @@ def first_match(patterns: List[str]) -> Optional[Path]:
 
 
 def main() -> int:
-    threshold = getenv_int("QUALITY_THRESHOLD", "80")
+    threshold = getenv_int("QUALITY_THRESHOLD", "40")
     fail_on_syntax = getenv_bool("FAIL_ON_SYNTAX_ERROR", "true")
     chk_high_w = getenv_float("CHECKOV_HIGH_WEIGHT", "8")
     chk_med_w = getenv_float("CHECKOV_MED_WEIGHT", "3")

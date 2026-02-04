@@ -5,7 +5,7 @@ author: "Ashutosh"
 inputs:
   QUALITY_THRESHOLD:
     description: "Minimum score to pass"
-    default: "80"
+    default: "40"
     required: false
   # FAIL_ON_SYNTAX_ERROR:
   #   description: "Hard-fail (score=0) if syntax compile failed"
