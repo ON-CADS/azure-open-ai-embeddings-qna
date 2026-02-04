@@ -1,0 +1,64 @@
+name: "Quality aggregate & score"
+description: "Aggregates tool outputs (flake8, mypy, bandit, radon, checkov) into JSON/Markdown and exposes pass/fail."
+author: "Ashutosh"
+
+inputs:
+  QUALITY_THRESHOLD:
+    description: "Minimum score to pass"
+    default: "80"
+    required: false
+  FAIL_ON_SYNTAX_ERROR:
+    description: "Hard-fail (score=0) if syntax compile failed"
+    default: "true"
+    required: false
+  CHECKOV_HIGH_WEIGHT:
+    description: "Weight per HIGH Checkov finding"
+    default: "8"
+    required: false
+  CHECKOV_MED_WEIGHT:
+    description: "Weight per MEDIUM Checkov finding"
+    default: "3"
+    required: false
+
+outputs:
+  score:
+    description: "Computed quality score"
+    value: ${{ steps.run-score.outputs.score }}
+  threshold:
+    description: "Threshold used for pass/fail"
+    value: ${{ steps.run-score.outputs.threshold }}
+  passed:
+    description: "true/false"
+    value: ${{ steps.run-score.outputs.passed }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Run code_quality_score.py
+      id: run-score
+      shell: bash
+      env:
+        QUALITY_THRESHOLD: ${{ inputs.QUALITY_THRESHOLD }}
+        FAIL_ON_SYNTAX_ERROR: ${{ inputs.FAIL_ON_SYNTAX_ERROR }}
+        CHECKOV_HIGH_WEIGHT: ${{ inputs.CHECKOV_HIGH_WEIGHT }}
+        CHECKOV_MED_WEIGHT: ${{ inputs.CHECKOV_MED_WEIGHT }}
+      run: |
+        mkdir -p outputs
+        python "${{ github.action_path }}/code_quality_score.py"
+
+        # Re-expose outputs (script already writes to $GITHUB_OUTPUT; this is defensive)
+        score=$(grep -E '^score=' "$GITHUB_OUTPUT" | tail -n1 | cut -d= -f2)
+        thresh=$(grep -E '^threshold=' "$GITHUB_OUTPUT" | tail -n1 | cut -d= -f2)
+        passed=$(grep -E '^passed=' "$GITHUB_OUTPUT" | tail -n1 | cut -d= -f2)
+        {
+          echo "score=${score}"
+          echo "threshold=${thresh}"
+          echo "passed=${passed}"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Attach summary to job
+      shell: bash
+      run: |
+        if [ -f outputs/quality_summary.md ]; then
+          cat outputs/quality_summary.md >> "$GITHUB_STEP_SUMMARY"
+        fi
