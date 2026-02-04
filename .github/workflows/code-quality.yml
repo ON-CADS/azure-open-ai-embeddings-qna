@@ -177,23 +177,23 @@ jobs:
               body
             });
 
-      - name: Send failure email to commit author (push only)
-        if: ${{ github.event_name == 'push' && steps.score.outputs.passed == 'false' && github.event.head_commit.author.email != '' && !contains(github.event.head_commit.author.email, 'noreply') }}
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "[${{ github.repository }}] Code Quality FAILED (score ${{ steps.score.outputs.score }}) on ${{ github.ref_name }}"
-          to: ${{ github.event.head_commit.author.email }}
-          from: ${{ secrets.SMTP_FROM }}
-          html_body: |
-            <p>Hi,</p>
-            <p>Your recent push to <b>${{ github.ref_name }}</b> failed the code quality gate.</p>
-            <p><b>Score:</b> ${{ steps.score.outputs.score }} (required: ${{ steps.score.outputs.threshold }})</p>
-            <p>See full report in the workflow run artifacts (quality_summary) and the job summary.</p>
-            <p>Repository: <a href="https://github.com/${{ github.repository }}b.repository }}</a></p>
+      # - name: Send failure email to commit author (push only)
+      #   if: ${{ github.event_name == 'push' && steps.score.outputs.passed == 'false' && github.event.head_commit.author.email != '' && !contains(github.event.head_commit.author.email, 'noreply') }}
+      #   uses: dawidd6/action-send-mail@v3
+      #   with:
+      #     server_address: ${{ secrets.SMTP_SERVER }}
+      #     server_port: ${{ secrets.SMTP_PORT }}
+      #     username: ${{ secrets.SMTP_USERNAME }}
+      #     password: ${{ secrets.SMTP_PASSWORD }}
+      #     subject: "[${{ github.repository }}] Code Quality FAILED (score ${{ steps.score.outputs.score }}) on ${{ github.ref_name }}"
+      #     to: ${{ github.event.head_commit.author.email }}
+      #     from: ${{ secrets.SMTP_FROM }}
+      #     html_body: |
+      #       <p>Hi,</p>
+      #       <p>Your recent push to <b>${{ github.ref_name }}</b> failed the code quality gate.</p>
+      #       <p><b>Score:</b> ${{ steps.score.outputs.score }} (required: ${{ steps.score.outputs.threshold }})</p>
+      #       <p>See full report in the workflow run artifacts (quality_summary) and the job summary.</p>
+      #       <p>Repository: <a href="https://github.com/${{ github.repository }}b.repository }}</a></p>
 
       - name: Fail if below threshold
         if: ${{ steps.score.outputs.passed == 'false' }}
