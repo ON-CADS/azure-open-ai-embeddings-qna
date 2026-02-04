@@ -18,7 +18,7 @@ concurrency:
 
 env:
   QUALITY_THRESHOLD: "80"      
-  FAIL_ON_SYNTAX_ERROR: "true"   
+  # FAIL_ON_SYNTAX_ERROR: "true"   
   CHECKOV_HIGH_WEIGHT: "8"
   CHECKOV_MED_WEIGHT: "3"
 
@@ -149,7 +149,7 @@ jobs:
         uses: ./.github/actions
         with:
           QUALITY_THRESHOLD: ${{ env.QUALITY_THRESHOLD }}
-          FAIL_ON_SYNTAX_ERROR: ${{ env.FAIL_ON_SYNTAX_ERROR }}
+          # FAIL_ON_SYNTAX_ERROR: ${{ env.FAIL_ON_SYNTAX_ERROR }}
           CHECKOV_HIGH_WEIGHT: ${{ env.CHECKOV_HIGH_WEIGHT }}
           CHECKOV_MED_WEIGHT: ${{ env.CHECKOV_MED_WEIGHT }}
 

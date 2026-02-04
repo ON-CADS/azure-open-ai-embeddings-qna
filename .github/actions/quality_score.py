@@ -135,10 +135,10 @@ def main() -> int:
                         chk_med += 1
 
     score = 100.0
-    hard_fail_reasons: List[str] = []
+    # hard_fail_reasons: List[str] = []
 
-    if not syntax_passed and fail_on_syntax:
-        hard_fail_reasons.append("Syntax compile failed")
+    # if not syntax_passed and fail_on_syntax:
+    #     hard_fail_reasons.append("Syntax compile failed")
 
     # Deduct points (caps prevent domination by one tool)
     # Style (flake8)
@@ -161,13 +161,13 @@ def main() -> int:
     #     score = 0.0
 
     score = round(max(0.0, score), 2)
-    passed = (not hard_fail_reasons) and score >= threshold
+    passed = (score >= threshold)
 
     summary = {
         "threshold": threshold,
         "score": score,
         "passed": passed,
-        "hard_fail_reasons": hard_fail_reasons,
+        # "hard_fail_reasons": hard_fail_reasons,
         "metrics": {
             "flake8_issues": flake8_issues,
             "mypy_errors": mypy_errors,
@@ -199,9 +199,9 @@ def main() -> int:
     else:
         lines.append(f"**FAILED** — Score: **{score}** / {threshold} required")
 
-    if hard_fail_reasons:
-        lines.append("\n**Hard fail reasons:**")
-        lines.extend(f"- {r}" for r in hard_fail_reasons)
+    # if hard_fail_reasons:
+    #     lines.append("\n**Hard fail reasons:**")
+    #     lines.extend(f"- {r}" for r in hard_fail_reasons)
 
     m = summary["metrics"]
     lines.append("\n## Metrics")

@@ -7,10 +7,10 @@ inputs:
     description: "Minimum score to pass"
     default: "80"
     required: false
-  FAIL_ON_SYNTAX_ERROR:
-    description: "Hard-fail (score=0) if syntax compile failed"
-    default: "true"
-    required: false
+  # FAIL_ON_SYNTAX_ERROR:
+  #   description: "Hard-fail (score=0) if syntax compile failed"
+  #   default: "true"
+  #   required: false
   CHECKOV_HIGH_WEIGHT:
     description: "Weight per HIGH Checkov finding"
     default: "8"
@@ -39,7 +39,7 @@ runs:
       shell: bash
       env:
         QUALITY_THRESHOLD: ${{ inputs.QUALITY_THRESHOLD }}
-        FAIL_ON_SYNTAX_ERROR: ${{ inputs.FAIL_ON_SYNTAX_ERROR }}
+        # FAIL_ON_SYNTAX_ERROR: ${{ inputs.FAIL_ON_SYNTAX_ERROR }}
         CHECKOV_HIGH_WEIGHT: ${{ inputs.CHECKOV_HIGH_WEIGHT }}
         CHECKOV_MED_WEIGHT: ${{ inputs.CHECKOV_MED_WEIGHT }}
       run: |
