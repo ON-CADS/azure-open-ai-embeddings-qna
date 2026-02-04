@@ -34,7 +34,7 @@ outputs:
 runs:
   using: "composite"
   steps:
-    - name: Run code_quality_score.py
+    - name: Run quality_score.py
       id: run-score
       shell: bash
       env:
@@ -44,7 +44,7 @@ runs:
         CHECKOV_MED_WEIGHT: ${{ inputs.CHECKOV_MED_WEIGHT }}
       run: |
         mkdir -p outputs
-        python "${{ github.action_path }}/code_quality_score.py"
+        python "${{ github.action_path }}/quality_score.py"
 
         # Re-expose outputs (script already writes to $GITHUB_OUTPUT; this is defensive)
         score=$(grep -E '^score=' "$GITHUB_OUTPUT" | tail -n1 | cut -d= -f2)
