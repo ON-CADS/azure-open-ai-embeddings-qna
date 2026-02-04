@@ -188,7 +188,6 @@ jobs:
           subject: "[${{ github.repository }}] Code Quality FAILED (score ${{ steps.score.outputs.score }}) on ${{ github.ref_name }}"
           to: ${{ github.event.head_commit.author.email }}
           from: ${{ secrets.SMTP_FROM }}
-          content_type: text/html
           html_body: |
             <p>Hi,</p>
             <p>Your recent push to <b>${{ github.ref_name }}</b> failed the code quality gate.</p>
