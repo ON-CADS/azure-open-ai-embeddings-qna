@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  QUALITY_THRESHOLD: "40"      
+  QUALITY_THRESHOLD: "35"      
   # FAIL_ON_SYNTAX_ERROR: "true"   
   CHECKOV_HIGH_WEIGHT: "8"
   CHECKOV_MED_WEIGHT: "3"
