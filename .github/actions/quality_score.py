@@ -1,5 +1,5 @@
 """
-Aggregates static-analysis outputs (flake8, mypy, bandit, radon, checkov)
+Aggregates static-analysis outputs (flake8, mypy, bandit, radon, PSRule for Azure)
 into a single JSON + Markdown summary and exposes pass/fail to GitHub Actions.
 """
 
@@ -8,7 +8,7 @@ import json
 import os
 import glob
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def getenv_bool(name: str, default: str = "false") -> bool:
@@ -45,138 +45,300 @@ def first_match(patterns: List[str]) -> Optional[Path]:
     return None
 
 
+# ---------------------------
+# Tool-specific parsers
+# ---------------------------
+
+def parse_flake8(path: Optional[Path]) -> Tuple[int, Dict[str, List[Dict[str, Any]]]]:
+    """
+    flake8-json output: dict keyed by file -> list of issues with:
+      code, text, line_number, column_number.
+    Returns (count, grouped_by_code)
+    """
+    total = 0
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    if not path:
+        return total, grouped
+
+    data = read_json(path)
+    if not isinstance(data, dict):
+        return total, grouped
+
+    for file_path, issues in data.items():
+        for it in (issues or []):
+            code = str(it.get("code") or "F000")
+            entry = {
+                "file": file_path,
+                "line": int(it.get("line_number") or 0),
+                "col": int(it.get("column_number") or 0),
+                "msg": str(it.get("text") or "").strip(),
+                "code": code,
+            }
+            grouped.setdefault(code, []).append(entry)
+            total += 1
+    return total, grouped
+
+
+def parse_mypy(path: Optional[Path]) -> Tuple[int, List[Dict[str, Any]]]:
+    """
+    mypy --error-format=json:
+      Can be a JSON object with "messages" OR line-delimited JSON records.
+      We collect only severity=="error".
+    Returns (error_count, list[ {file,line,col,msg,code} ])
+    """
+    results: List[Dict[str, Any]] = []
+    if not path:
+        return 0, results
+
+    raw = None
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception:
+        return 0, results
+
+    # Try object first
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict) and isinstance(obj.get("messages"), list):
+            for m in obj["messages"]:
+                sev = str(m.get("severity", "")).lower()
+                if sev == "error" or "message" in m:
+                    results.append({
+                        "file": m.get("path") or m.get("filename"),
+                        "line": int(m.get("line", 0) or 0),
+                        "col": int(m.get("column", 0) or 0),
+                        "msg": m.get("message") or "",
+                        "code": (m.get("code") or {}).get("id") if isinstance(m.get("code"), dict) else m.get("code"),
+                    })
+            return len(results), results
+        elif isinstance(obj, list):
+            # some wrappers may emit a list
+            for m in obj:
+                if not isinstance(m, dict):
+                    continue
+                sev = str(m.get("severity", "")).lower()
+                if sev == "error" or "message" in m:
+                    results.append({
+                        "file": m.get("path") or m.get("filename"),
+                        "line": int(m.get("line", 0) or 0),
+                        "col": int(m.get("column", 0) or 0),
+                        "msg": m.get("message") or "",
+                        "code": (m.get("code") or {}).get("id") if isinstance(m.get("code"), dict) else m.get("code"),
+                    })
+            return len(results), results
+    except Exception:
+        pass
+
+    # Fallback: line-delimited JSON
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            m = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(m, dict):
+            continue
+        sev = str(m.get("severity", "")).lower()
+        if sev == "error" or "message" in m:
+            results.append({
+                "file": m.get("path") or m.get("filename"),
+                "line": int(m.get("line", 0) or 0),
+                "col": int(m.get("column", 0) or 0),
+                "msg": m.get("message") or "",
+                "code": (m.get("code") or {}).get("id") if isinstance(m.get("code"), dict) else m.get("code"),
+            })
+    return len(results), results
+
+
+def parse_bandit(path: Optional[Path]) -> Tuple[int, int, Dict[str, List[Dict[str, Any]]]]:
+    """
+    Bandit JSON: dict with "results": [
+      { "issue_severity": "HIGH"/"MEDIUM"/..., "test_id": "Bxxx",
+        "issue_text": str, "filename": str, "line_number": int }
+    ]
+    Returns (high_count, med_count, grouped_by_test_id)
+    """
+    high = med = 0
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    if not path:
+        return high, med, grouped
+
+    data = read_json(path)
+    if not (isinstance(data, dict) and isinstance(data.get("results"), list)):
+        return high, med, grouped
+
+    for r in data["results"]:
+        sev = str(r.get("issue_severity", "")).upper()
+        test = str(r.get("test_id") or "B000")
+        if sev == "HIGH":
+            high += 1
+        elif sev == "MEDIUM":
+            med += 1
+        grouped.setdefault(test, []).append({
+            "file": r.get("filename"),
+            "line": int(r.get("line_number") or 0),
+            "msg": r.get("issue_text"),
+            "severity": sev,
+            "test_id": test,
+        })
+    return high, med, grouped
+
+
+def parse_radon(path: Optional[Path], threshold: int = 15) -> Tuple[int, int, List[Dict[str, Any]]]:
+    """
+    radon cc -j: dict mapping "file.py" -> [ { "name", "complexity", "lineno", ... } ]
+    We count violations where complexity > threshold.
+    Returns (violations_count, max_cc, list[ {file,line,name,complexity} ])
+    """
+    viol = 0
+    max_cc = 0
+    items: List[Dict[str, Any]] = []
+    if not path:
+        return viol, max_cc, items
+
+    data = read_json(path) or {}
+    if not isinstance(data, dict):
+        return viol, max_cc, items
+
+    for file_path, entries in data.items():
+        for e in (entries or []):
+            try:
+                c = int(e.get("complexity", 0))
+            except Exception:
+                c = 0
+            if c > threshold:
+                viol += 1
+                items.append({
+                    "file": file_path,
+                    "line": int(e.get("lineno") or 0),
+                    "name": e.get("name"),
+                    "complexity": c,
+                })
+            if c > max_cc:
+                max_cc = c
+    return viol, max_cc, items
+
+
+def _normalize_psrule_level(level_val: Any) -> str:
+    """
+    Normalize PSRule Level to 'error' | 'warning' | 'information'.
+    JSON may carry a string or a numeric value.
+      1 -> error, 2 -> warning, 3 -> information  (per PSRule examples)
+    """
+    if isinstance(level_val, str):
+        return level_val.strip().lower()
+    if isinstance(level_val, (int, float)):
+        return {1: "error", 2: "warning", 3: "information"}.get(int(level_val), "information")
+    return "information"
+
+
+def parse_psrule_json(path: Optional[Path]) -> Tuple[int, int, Dict[str, Dict[str, Any]]]:
+    """
+    Parse PSRule JSON array:
+      Each record may contain: ruleName, info.displayName, outcome, level, source[] -> file/line.
+    Count FAIL outcomes: Error->high, Warning->medium.
+    Returns (high_count, med_count, issues_by_rule)
+    """
+    high = med = 0
+    issues: Dict[str, Dict[str, Any]] = {}
+    if not path:
+        return high, med, issues
+
+    data = read_json(path)
+    if not isinstance(data, list):
+        return high, med, issues
+
+    for rec in data:
+        if not isinstance(rec, dict):
+            continue
+        outcome = str(rec.get("outcome", "")).lower()
+        if outcome != "fail":
+            continue
+
+        rule_name = str(rec.get("ruleName") or rec.get("info", {}).get("name") or "unknown")
+        display_name = (rec.get("info") or {}).get("displayName") or rule_name
+        level = _normalize_psrule_level(rec.get("level"))
+        if level == "error":
+            high += 1
+        elif level == "warning":
+            med += 1
+
+        src = rec.get("source") or []
+        bucket = issues.setdefault(rule_name, {
+            "displayName": display_name,
+            "level": level,
+            "occurrences": set(),
+        })
+        for s in src:
+            if not isinstance(s, dict):
+                continue
+            f = s.get("file")
+            ln = s.get("line")
+            if f:
+                bucket["occurrences"].add((str(f), int(ln) if isinstance(ln, (int, float)) else None))
+
+    return high, med, issues
+
+
 def main() -> int:
     threshold = getenv_int("QUALITY_THRESHOLD", "35")
-    fail_on_syntax = getenv_bool("FAIL_ON_SYNTAX_ERROR", "true")
-    chk_high_w = getenv_float("CHECKOV_HIGH_WEIGHT", "8")
-    chk_med_w = getenv_float("CHECKOV_MED_WEIGHT", "3")
+    # keep env var names for backwards compatibility
+    ps_high_w = getenv_float("PSRULE_HIGH_WEIGHT", "8")
+    ps_med_w = getenv_float("PSRULE_MED_WEIGHT", "3")
 
     out_dir = Path("outputs")
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Locate artifacts saved by earlier jobs
     flake8_p = first_match(["artifacts/python/**/flake8.json"])
     mypy_p = first_match(["artifacts/python/**/mypy.json"])
     bandit_p = first_match(["artifacts/python/**/bandit.json"])
     radon_p = first_match(["artifacts/python/**/radon_cc.json"])
     syntax_p = first_match(["artifacts/python/**/syntax.json"])
-
-    checkov_p = first_match([
-        "artifacts/checkov/**/checkov.json",
-        "artifacts/checkov/**/results_json.json",
-        "artifacts/checkov/**/checkov*.json",
+    psrule_json_p = first_match([
+        "artifacts/psrule/**/psrule.json",
     ])
 
-    # --- Parse metrics ---
-
-    flake8_issues = 0
-    if flake8_p:
-        fj = read_json(flake8_p)
-        if isinstance(fj, dict):
-            flake8_issues = sum(len(v or []) for v in fj.values())
-
-    mypy_errors = 0
-    if mypy_p:
-        mj = read_json(mypy_p)
-        if isinstance(mj, dict):
-            if isinstance(mj.get("messages"), list):
-                mypy_errors = sum(
-                    1 for m in mj["messages"]
-                    if str(m.get("severity", "")).lower() == "error" or "message" in m
-                )
-            elif isinstance(mj.get("errors"), int):
-                mypy_errors = mj["errors"]
-        elif isinstance(mj, list):
-            mypy_errors = len(mj)
-
-    bandit_high = bandit_med = 0
-    if bandit_p:
-        bj = read_json(bandit_p)
-        if isinstance(bj, dict) and isinstance(bj.get("results"), list):
-            for r in bj["results"]:
-                sev = str(r.get("issue_severity", "")).upper()
-                if sev == "HIGH":
-                    bandit_high += 1
-                elif sev == "MEDIUM":
-                    bandit_med += 1
-
-    radon_viol = 0
-    max_cc = 0
-    if radon_p:
-        rj = read_json(radon_p) or {}
-        if isinstance(rj, dict):
-            for entries in rj.values():
-                for e in entries or []:
-                    try:
-                        c = int(e.get("complexity", 0))
-                    except Exception:
-                        c = 0
-                    if c > 15:
-                        radon_viol += 1
-                    if c > max_cc:
-                        max_cc = c
+    # ---- Parse metrics & details ----
+    flake8_total, flake8_by_code = parse_flake8(flake8_p)
+    mypy_errors, mypy_list = parse_mypy(mypy_p)
+    bandit_high, bandit_med, bandit_by_test = parse_bandit(bandit_p)
+    radon_viol, radon_max_cc, radon_list = parse_radon(radon_p, threshold=15)
 
     syntax_passed = True
     if syntax_p:
         sj = read_json(syntax_p) or {}
         syntax_passed = bool(sj.get("passed", True))
 
-    chk_high = chk_med = 0
-    if checkov_p:
-        cj = read_json(checkov_p)
-        if isinstance(cj, dict):
-            res = cj.get("results") or {}
-            failed = res.get("failed_checks") or []
-            if isinstance(failed, list):
-                for fc in failed:
-                    sev = str(fc.get("severity", "")).upper()
-                    if sev == "HIGH":
-                        chk_high += 1
-                    elif sev == "MEDIUM":
-                        chk_med += 1
+    ps_high, ps_med, ps_by_rule = parse_psrule_json(psrule_json_p)
 
+    # ---- Score (same scales you used) ----
     score = 100.0
-    # hard_fail_reasons: List[str] = []
-
-    # if not syntax_passed and fail_on_syntax:
-    #     hard_fail_reasons.append("Syntax compile failed")
-
-    # Deduct points (caps prevent domination by one tool)
-    # Style (flake8)
-    score -= min(30.0, 0.5 * flake8_issues)
-
-    # Typing (mypy)
+    score -= min(30.0, 0.5 * flake8_total)
     score -= min(30.0, 1.0 * mypy_errors)
-
-    # Python security (bandit)
     score -= min(30.0, 10.0 * bandit_high + 5.0 * bandit_med)
-
-    # Complexity (radon)
     score -= min(20.0, 5.0 * radon_viol)
-
-    # IaC security (Checkov)
-    score -= min(30.0, chk_high_w * chk_high + chk_med_w * chk_med)
-
-    # Hard fail: zero score for clarity if syntax failed and switch is on
-    # if hard_fail_reasons:
-    #     score = 0.0
+    score -= min(30.0, ps_high_w * ps_high + ps_med_w * ps_med)
 
     score = round(max(0.0, score), 2)
     passed = (score >= threshold)
 
+    # ---- JSON summary payload ----
     summary = {
         "threshold": threshold,
         "score": score,
         "passed": passed,
-        # "hard_fail_reasons": hard_fail_reasons,
         "metrics": {
-            "flake8_issues": flake8_issues,
+            "flake8_issues": flake8_total,
             "mypy_errors": mypy_errors,
             "bandit_high": bandit_high,
             "bandit_med": bandit_med,
             "radon_violations_over_15": radon_viol,
-            "radon_max_complexity": max_cc,
-            "checkov_high": chk_high,
-            "checkov_medium": chk_med,
+            "radon_max_complexity": radon_max_cc,
+            "psrule_high": ps_high,
+            "psrule_medium": ps_med,
         },
         "files": {
             "flake8": str(flake8_p) if flake8_p else None,
@@ -184,46 +346,109 @@ def main() -> int:
             "bandit": str(bandit_p) if bandit_p else None,
             "radon_cc": str(radon_p) if radon_p else None,
             "syntax": str(syntax_p) if syntax_p else None,
-            "checkov": str(checkov_p) if checkov_p else None,
+            "psrule": str(psrule_json_p) if psrule_json_p else None,
         },
+        "details": {
+            "flake8_by_code": flake8_by_code,
+            "mypy": mypy_list,
+            "bandit_by_test": bandit_by_test,
+            "radon": radon_list,
+            "psrule_by_rule": {
+                rn: {
+                    "displayName": d.get("displayName"),
+                    "level": d.get("level"),
+                    "occurrences": sorted([(f, l) for (f, l) in d.get("occurrences", set())],
+                                          key=lambda t: (t[0], (t[1] if t[1] is not None else -1)))
+                }
+                for rn, d in ps_by_rule.items()
+            }
+        }
     }
 
-    (out_dir / "quality_summary.json").write_text(
-        json.dumps(summary, indent=2), encoding="utf-8"
-    )
+    Path("outputs/quality_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
+    # ---- Markdown summary ----
     lines: List[str] = []
     lines.append("# Code Quality Summary\n")
-    if summary["passed"]:
-        lines.append(f"**PASSED** — Score: **{score}** / {threshold} required")
-    else:
-        lines.append(f"**FAILED** — Score: **{score}** / {threshold} required")
+    lines.append(f"**{'PASSED' if passed else 'FAILED'}** — Score: **{score}** / {threshold} required")
 
-    # if hard_fail_reasons:
-    #     lines.append("\n**Hard fail reasons:**")
-    #     lines.extend(f"- {r}" for r in hard_fail_reasons)
-
+    # Metrics
     m = summary["metrics"]
     lines.append("\n## Metrics")
     lines.append(f"- Flake8 issues: **{m['flake8_issues']}**")
     lines.append(f"- Mypy errors: **{m['mypy_errors']}**")
     lines.append(f"- Bandit: **{m['bandit_high']} HIGH**, **{m['bandit_med']} MEDIUM**")
     lines.append(
-        f"- Radon: **{m['radon_violations_over_15']}** functions/methods over CC>15 "
-        f"(max CC: {m['radon_max_complexity']})"
+        f"- Radon: **{m['radon_violations_over_15']}** functions/methods over CC>15 (max CC: {m['radon_max_complexity']})"
     )
-    lines.append(f"- Checkov: **{m['checkov_high']} HIGH**, **{m['checkov_medium']} MEDIUM**")
-    lines.append(
-        "\n> See run artifacts for detailed JSON reports (flake8, mypy, bandit, radon, checkov) "
-        "and SARIF in code scanning."
-    )
+    lines.append(f"- PSRule for Azure (IaC): **{m['psrule_high']} ERROR**, **{m['psrule_medium']} WARNING**")
 
-    (out_dir / "quality_summary.md").write_text("\n".join(lines), encoding="utf-8")
+    # Failed issues
+    lines.append("\n## Failed issues (structured, all tools)")
+    # Syntax
+    if not syntax_passed:
+        lines.append("\n### Python syntax (compile)")
+        lines.append("- **Compile failed** — see `outputs/syntax.json` for the overall status")
 
+    # Flake8
+    if flake8_total > 0:
+        lines.append("\n### Flake8")
+        for code in sorted(flake8_by_code.keys()):
+            items = flake8_by_code[code]
+            lines.append(f"**{code}** — {len(items)} occurrence(s)")
+            for it in sorted(items, key=lambda x: (x['file'] or '', x['line'], x['col'])):
+                lines.append(f"- `{it['file']}:{it['line']}:{it['col']}` — {it['msg']}")
+
+    # Mypy
+    if mypy_errors > 0:
+        lines.append("\n### Mypy")
+        lines.append(f"**error** — {mypy_errors} occurrence(s)")
+        for it in sorted(mypy_list, key=lambda x: (x['file'] or '', x['line'], x['col'])):
+            code = f" [{it['code']}]" if it.get("code") else ""
+            lines.append(f"- `{it['file']}:{it['line']}:{it['col']}` — {it['msg']}{code}")
+
+    # Bandit
+    if bandit_high + bandit_med > 0:
+        lines.append("\n### Bandit")
+        for test_id in sorted(bandit_by_test.keys()):
+            items = bandit_by_test[test_id]
+            lines.append(f"**{test_id}** — {len(items)} occurrence(s)")
+            for it in sorted(items, key=lambda x: (x['file'] or '', x['line'])):
+                lines.append(f"- `{it['file']}:{it['line']}` — {it['msg']} ({it['severity']})")
+
+    # Radon
+    if radon_viol > 0:
+        lines.append("\n### Radon (complexity > 15)")
+        lines.append(f"**Violation** — {radon_viol} occurrence(s)")
+        for it in sorted(radon_list, key=lambda x: (x['file'] or '', x['line'])):
+            nm = f"{it['name']}".strip() if it.get("name") else "unknown"
+            lines.append(f"- `{it['file']}:{it['line']}` — `{nm}` (CC={it['complexity']})")
+
+    # PSRule
+    if ps_high + ps_med > 0:
+        lines.append("\n### PSRule for Azure")
+        # Sort by severity then rule name
+        def sev_rank(level: str) -> int:
+            return {"error": 0, "warning": 1, "information": 2}.get(level or "information", 3)
+        for rn, data in sorted(ps_by_rule.items(), key=lambda kv: (sev_rank(kv[1].get("level")), kv[0].lower())):
+            display = data.get("displayName") or rn
+            level = str(data.get("level") or "information").upper()
+            occs = sorted(list(data.get("occurrences", set())), key=lambda t: (t[0], (t[1] if t[1] is not None else -1)))
+            lines.append(f"**{display}** (`{rn}`) — Level: **{level}** — {len(occs)} occurrence(s)")
+            for (f, l) in occs:
+                suffix = f":{l}" if l is not None else ""
+                lines.append(f"- `{f}{suffix}`")
+
+    lines.append("\n> All raw reports are saved as JSON artifacts (flake8, mypy, bandit, radon, psrule).")
+
+    Path("outputs/quality_summary.md").write_text("\n".join(lines), encoding="utf-8")
+
+    # Grouped log
     print("::group::Quality Summary")
     print("\n".join(lines))
     print("::endgroup::")
 
+    # Expose outputs
     gh_out = os.environ.get("GITHUB_OUTPUT")
     if gh_out:
         Path(gh_out).write_text(

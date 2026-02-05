@@ -2,7 +2,7 @@ name: Python Code Quality Checker
 
 on:
   pull_request:
-    branches: [ main, dev ]
+    branches: [ main, dev, demo ]
   push:
     branches: [ main, dev, demo ]
 
@@ -17,10 +17,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  QUALITY_THRESHOLD: "35"      
-  # FAIL_ON_SYNTAX_ERROR: "true"   
-  CHECKOV_HIGH_WEIGHT: "8"
-  CHECKOV_MED_WEIGHT: "3"
+  QUALITY_THRESHOLD: "35"
+  # FAIL_ON_SYNTAX_ERROR: "true"
+  PSRULE_HIGH_WEIGHT: "8"   # maps to PSRule Error
+  PSRULE_MED_WEIGHT: "3"    # maps to PSRule Warning
 
 jobs:
   python_quality:
@@ -84,8 +84,9 @@ jobs:
           name: python_outputs
           path: outputs
 
-  checkov:
-    name: IaC security (Checkov) → outputs/checkov.json + SARIF
+  # PSRule for Azure
+  psrule:
+    name: IaC security (PSRule for Azure JSON) → outputs/psrule.json
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -93,51 +94,41 @@ jobs:
       - name: Prepare outputs dir
         run: mkdir -p outputs
 
-      - name: Run Checkov
-        id: checkov
-        uses: bridgecrewio/checkov-action@v12
+      - name: Analyze Azure IaC with PSRule for Azure (JSON)
+        uses: microsoft/ps-rule@v2.9.0
         continue-on-error: true
         with:
-          directory: .
-          quiet: true
-          framework: terraform,cloudformation,kubernetes,arm,helm,serverless
-          soft_fail: false
-          output_format: sarif,json
-          output_file_path: outputs/checkov.sarif,outputs/checkov.json
+          modules: 'PSRule.Rules.Azure'
+          outputFormat: Json
+          outputPath: outputs/psrule.json
 
-      - name: Upload SARIF to code scanning
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: outputs/checkov.sarif
-
-      - name: Upload Checkov outputs
+      - name: Upload PSRule outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: checkov_outputs
+          name: psrule_outputs
           path: outputs
 
   aggregate_score:
     name: Aggregate → single JSON + Markdown, score & notify
     runs-on: ubuntu-latest
     if: always()
-    needs: [python_quality, checkov]
+    needs: [python_quality, psrule]
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-  
+
       - name: Download Python outputs
         uses: actions/download-artifact@v4
         with:
           name: python_outputs
           path: artifacts/python
 
-      - name: Download Checkov outputs
+      - name: Download PSRule outputs
         uses: actions/download-artifact@v4
         with:
-          name: checkov_outputs
-          path: artifacts/checkov
+          name: psrule_outputs
+          path: artifacts/psrule
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -150,8 +141,8 @@ jobs:
         with:
           QUALITY_THRESHOLD: ${{ env.QUALITY_THRESHOLD }}
           # FAIL_ON_SYNTAX_ERROR: ${{ env.FAIL_ON_SYNTAX_ERROR }}
-          CHECKOV_HIGH_WEIGHT: ${{ env.CHECKOV_HIGH_WEIGHT }}
-          CHECKOV_MED_WEIGHT: ${{ env.CHECKOV_MED_WEIGHT }}
+          PSRULE_HIGH_WEIGHT: ${{ env.PSRULE_HIGH_WEIGHT }}
+          PSRULE_MED_WEIGHT: ${{ env.PSRULE_MED_WEIGHT }}
 
       - name: Upload aggregated summary
         uses: actions/upload-artifact@v4
@@ -177,28 +168,8 @@ jobs:
               body
             });
 
-      # - name: Send failure email to commit author (push only)
-      #   if: ${{ github.event_name == 'push' && steps.score.outputs.passed == 'false' && github.event.head_commit.author.email != '' && !contains(github.event.head_commit.author.email, 'noreply') }}
-      #   uses: dawidd6/action-send-mail@v3
-      #   with:
-      #     server_address: ${{ secrets.SMTP_SERVER }}
-      #     server_port: ${{ secrets.SMTP_PORT }}
-      #     username: ${{ secrets.SMTP_USERNAME }}
-      #     password: ${{ secrets.SMTP_PASSWORD }}
-      #     subject: "[${{ github.repository }}] Code Quality FAILED (score ${{ steps.score.outputs.score }}) on ${{ github.ref_name }}"
-      #     to: ${{ github.event.head_commit.author.email }}
-      #     from: ${{ secrets.SMTP_FROM }}
-      #     html_body: |
-      #       <p>Hi,</p>
-      #       <p>Your recent push to <b>${{ github.ref_name }}</b> failed the code quality gate.</p>
-      #       <p><b>Score:</b> ${{ steps.score.outputs.score }} (required: ${{ steps.score.outputs.threshold }})</p>
-      #       <p>See full report in the workflow run artifacts (quality_summary) and the job summary.</p>
-      #       <p>Repository: <a href="https://github.com/${{ github.repository }}b.repository }}</a></p>
-
       - name: Fail if below threshold
         if: ${{ steps.score.outputs.passed == 'false' }}
         run: |
           echo "Quality score ${{ steps.score.outputs.score }} is below threshold ${{ steps.score.outputs.threshold }}."
           exit 1
-
-  
