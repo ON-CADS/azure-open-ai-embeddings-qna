@@ -195,7 +195,7 @@ def main() -> int:
     lines: List[str] = []
     lines.append("# Code Quality Summary\n")
     if summary["passed"]:
-        lines.append(f"* PASSED** — Score: **{score}** / {threshold} required")
+        lines.append(f"**PASSED** — Score: **{score}** / {threshold} required")
     else:
         lines.append(f"**FAILED** — Score: **{score}** / {threshold} required")
 
