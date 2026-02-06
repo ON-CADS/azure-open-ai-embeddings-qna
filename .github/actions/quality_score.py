@@ -313,9 +313,9 @@ def main() -> int:
     # ---- Score (same scales you used) ----
     score = 100.0
     score -= min(30.0, 0.5 * flake8_total)
-    score -= min(30.0, 1.0 * mypy_errors)
+    score -= min(30.0, 0.5 * mypy_errors)
     score -= min(30.0, 5.0 * bandit_high + 3.0 * bandit_med)
-    score -= min(20.0, 3.0 * radon_viol)
+    score -= min(20.0, 2.0 * radon_viol)
     score -= min(30.0, chk_w * checkov_failed)
 
     score = round(max(0.0, score), 2)
