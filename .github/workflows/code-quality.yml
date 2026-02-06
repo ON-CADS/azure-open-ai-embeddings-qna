@@ -86,7 +86,7 @@ jobs:
 
 
   checkov:
-    name: IaC security (Checkov) → outputs/checkov.json
+    name: IaC security (Checkov) → outputs/checkov.json + SARIF
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -103,8 +103,14 @@ jobs:
           quiet: true
           framework: terraform,cloudformation,kubernetes,arm,helm,serverless
           soft_fail: false
-          output_format: json
-          output_file_path: outputs/checkov.json
+          output_format: sarif,json
+          output_file_path: outputs/checkov.sarif,outputs/checkov.json
+
+      - name: Upload SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: outputs/checkov.sarif
 
       - name: Upload Checkov outputs
         if: always()
