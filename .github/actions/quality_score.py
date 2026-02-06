@@ -293,6 +293,7 @@ def main() -> int:
     syntax_p = first_match(["artifacts/python/**/syntax.json"])
     checkov_p = first_match([
         "artifacts/checkov/**/checkov.json",
+        "artifacts/checkov/**/results_json.json"
     ])
 
     # ---- Parse metrics & details ----
