@@ -7,7 +7,8 @@ These instructions apply when GitHub copilot is reviewing code.
 - Flag code and infra security risks (input validation,auth checks,secrets handling).
 - Provide fixes abd code refactoring suggestions for the raised issues.
 - Check if test cases are added in the repository or not.
-- Check if all edge cases are handled in the test cases.
+- Check if all edge cases are handled in the test cases and add the missing ones.
+- Run all these test cases and validate if all test cases are passed.
 
 ## Language & Style:
 - Match the naming conventions already present in the codebase.
