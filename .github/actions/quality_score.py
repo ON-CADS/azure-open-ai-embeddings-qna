@@ -1,5 +1,5 @@
 """
-Aggregates static-analysis outputs (flake8, mypy, bandit, radon, Checkov)
+Aggregates static-analysis outputs (flake8, mypy, bandit, radon, Trivy)
 into a single JSON + Markdown summary and exposes pass/fail to GitHub Actions.
 """
 
@@ -112,7 +112,6 @@ def parse_mypy(path: Optional[Path]) -> Tuple[int, List[Dict[str, Any]]]:
                     })
             return len(results), results
         elif isinstance(obj, list):
-            # some wrappers may emit a list
             for m in obj:
                 if not isinstance(m, dict):
                     continue
@@ -221,19 +220,19 @@ def parse_radon(path: Optional[Path], threshold: int = 15) -> Tuple[int, int, Li
     return viol, max_cc, items
 
 
-def parse_checkov(path: Optional[Path]) -> Tuple[int, Dict[str, Dict[str, Any]]]:
+def parse_trivy(path: Optional[Path]) -> Tuple[int, Dict[str, Dict[str, Any]]]:
     """
-    Parse Checkov JSON for failed checks:
-      data["results"]["failed_checks"] is a list of findings with fields like:
-      check_id, check_name, severity, file_path, file_line_range, resource, guideline, etc.
+    Parse Trivy JSON for IaC misconfigurations:
+      data["Results"][*]["Misconfigurations"] is a list of findings with fields like:
+      ID, Title, Severity, PrimaryURL, CauseMetadata(StartLine, EndLine, Resource, ...)
 
     Returns:
-      (failed_count, by_check_id)
-      where by_check_id = {
-        "CKV_...": {
+      (failed_count, by_id)
+      where by_id = {
+        "AVD-.../KSV.../DS...": {
             "name": str,
-            "severity": str (last seen; varies per finding),
-            "occurrences": set( (file, line_start, line_end, resource, guideline) )
+            "severity": str,
+            "occurrences": set( (target, line_start, line_end, resource, primary_url) )
         }, ...
       }
     """
@@ -243,44 +242,65 @@ def parse_checkov(path: Optional[Path]) -> Tuple[int, Dict[str, Dict[str, Any]]]
         return total_failed, by_id
 
     data = read_json(path) or {}
-    res = {}
+    results = []
     if isinstance(data, dict):
-        res = data.get("results") or {}
-    failed = []
-    if isinstance(res, dict):
-        failed = res.get("failed_checks") or []
-    if not isinstance(failed, list):
-        failed = []
+        results = data.get("Results") or []
+    if not isinstance(results, list):
+        results = []
 
-    for fc in failed:
-        if not isinstance(fc, dict):
+    for r in results:
+        if not isinstance(r, dict):
             continue
-        total_failed += 1
-        check_id = str(fc.get("check_id") or "CKV_UNKNOWN")
-        name = str(fc.get("check_name") or check_id)
-        severity = str(fc.get("severity") or "").upper()
-        file_path = str(fc.get("file_path") or "").lstrip("./")
-        line_range = fc.get("file_line_range") or []
-        line_start = int(line_range[0]) if line_range and isinstance(line_range[0], (int, float)) else None
-        line_end = int(line_range[1]) if len(line_range) > 1 and isinstance(line_range[1], (int, float)) else None
-        resource = str(fc.get("resource") or "")
-        guideline = str(fc.get("guideline") or "")
+        target = str(r.get("Target") or r.get("ArtifactName") or "").lstrip("./")
+        miscs = r.get("Misconfigurations") or []
+        if not isinstance(miscs, list):
+            miscs = []
 
-        bucket = by_id.setdefault(check_id, {
-            "name": name,
-            "severity": severity,
-            "occurrences": set(),
-        })
-        bucket["severity"] = severity or bucket.get("severity")  # keep last non-empty
-        bucket["occurrences"].add((file_path, line_start, line_end, resource, guideline))
+        for mc in miscs:
+            if not isinstance(mc, dict):
+                continue
+            total_failed += 1
+            mid = str(mc.get("ID") or "TRIVY_UNKNOWN")
+            title = str(mc.get("Title") or mid)
+            severity = str(mc.get("Severity") or "UNKNOWN").upper()
+            primary = str(mc.get("PrimaryURL") or "")
+            cause = mc.get("CauseMetadata") or {}
+            if not isinstance(cause, dict):
+                cause = {}
+            resource = str(cause.get("Resource") or cause.get("resource") or "")
+            line_start = cause.get("StartLine")
+            line_end = cause.get("EndLine")
+
+            try:
+                line_start = int(line_start) if line_start is not None else None
+            except Exception:
+                line_start = None
+            try:
+                line_end = int(line_end) if line_end is not None else None
+            except Exception:
+                line_end = None
+
+            bucket = by_id.setdefault(mid, {
+                "name": title,
+                "severity": severity,
+                "occurrences": set(),
+            })
+            # keep last non-empty severity/title
+            if title:
+                bucket["name"] = title
+            if severity:
+                bucket["severity"] = severity
+
+            bucket["occurrences"].add((target, line_start, line_end, resource, primary))
 
     return total_failed, by_id
 
+
 def main() -> int:
     threshold = getenv_int("QUALITY_THRESHOLD", "35")
-    # keep env var names for backwards compatibility
-    # ps_high_w = getenv_float("PSRULE_HIGH_WEIGHT", "8")
-    chk_w = getenv_float("CHECKOV_WEIGHT", "3")
+
+    # Backward compatible: prefer TRIVY_WEIGHT; fallback to CHECKOV_WEIGHT; then default "3"
+    trivy_w = getenv_float("TRIVY_WEIGHT", os.getenv("CHECKOV_WEIGHT", "3"))
 
     out_dir = Path("outputs")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -291,10 +311,11 @@ def main() -> int:
     bandit_p = first_match(["artifacts/python/**/bandit.json"])
     radon_p = first_match(["artifacts/python/**/radon_cc.json"])
     syntax_p = first_match(["artifacts/python/**/syntax.json"])
-    checkov_p = first_match([
-        "artifacts/checkov/**/checkov.json",
-        "artifacts/checkov/**/results_json.json",
-        "artifacts/checkov/**/checkov*.json"
+
+    trivy_p = first_match([
+        "artifacts/trivy/**/trivy.json",
+        "artifacts/trivy/**/results.json",
+        "artifacts/trivy/**/trivy*.json",
     ])
 
     # ---- Parse metrics & details ----
@@ -308,7 +329,7 @@ def main() -> int:
         sj = read_json(syntax_p) or {}
         syntax_passed = bool(sj.get("passed", True))
 
-    checkov_failed, checkov_by_id = parse_checkov(checkov_p)
+    trivy_failed, trivy_by_id = parse_trivy(trivy_p)
 
     # ---- Score (same scales you used) ----
     score = 100.0
@@ -316,7 +337,7 @@ def main() -> int:
     score -= min(30.0, 0.5 * mypy_errors)
     score -= min(30.0, 5.0 * bandit_high + 3.0 * bandit_med)
     score -= min(20.0, 2.0 * radon_viol)
-    score -= min(30.0, chk_w * checkov_failed)
+    score -= min(30.0, trivy_w * trivy_failed)
 
     score = round(max(0.0, score), 2)
     passed = (score >= threshold)
@@ -333,7 +354,7 @@ def main() -> int:
             "bandit_med": bandit_med,
             "radon_violations_over_15": radon_viol,
             "radon_max_complexity": radon_max_cc,
-            "checkov_failed": checkov_failed
+            "trivy_failed": trivy_failed
         },
         "files": {
             "flake8": str(flake8_p) if flake8_p else None,
@@ -341,21 +362,23 @@ def main() -> int:
             "bandit": str(bandit_p) if bandit_p else None,
             "radon_cc": str(radon_p) if radon_p else None,
             "syntax": str(syntax_p) if syntax_p else None,
-            "checkov": str(checkov_p) if checkov_p else None,
+            "trivy": str(trivy_p) if trivy_p else None,
         },
         "details": {
             "flake8_by_code": flake8_by_code,
             "mypy": mypy_list,
             "bandit_by_test": bandit_by_test,
             "radon": radon_list,
-            "checkov_by_id": {
-                cid: {
+            "trivy_by_id": {
+                tid: {
                     "name": d.get("name"),
                     "severity": d.get("severity"),
-                    "occurrences": sorted(list(d.get("occurrences", set())),
-                                          key=lambda t: (t[0] or "", (t[1] if t[1] is not None else -1)))
+                    "occurrences": sorted(
+                        list(d.get("occurrences", set())),
+                        key=lambda t: (t[0] or "", (t[1] if t[1] is not None else -1))
+                    )
                 }
-                for cid, d in checkov_by_id.items()
+                for tid, d in trivy_by_id.items()
             }
         }
     }
@@ -376,10 +399,10 @@ def main() -> int:
     lines.append(
         f"- Radon: **{m['radon_violations_over_15']}** functions/methods over CC>15 (max CC: {m['radon_max_complexity']})"
     )
-    lines.append(f"- Checkov (IaC): **{m['checkov_failed']} failed**")
+    lines.append(f"- Trivy (IaC misconfig): **{m['trivy_failed']} failed**")
 
-    # Failed issues
     lines.append("\n## Failed issues (structured, all tools)")
+
     # Syntax
     if not syntax_passed:
         lines.append("\n### Python syntax (compile)")
@@ -419,29 +442,29 @@ def main() -> int:
             nm = f"{it['name']}".strip() if it.get("name") else "unknown"
             lines.append(f"- `{it['file']}:{it['line']}` — `{nm}` (CC={it['complexity']})")
 
-    # Checkov
-    if checkov_failed > 0:
-        lines.append("\n### Checkov")
+    # Trivy
+    if trivy_failed > 0:
+        lines.append("\n### Trivy (IaC misconfigurations)")
         def sev_rank(val: str) -> int:
-            return {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}.get(val or "UNKNOWN", 5)
+            return {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}.get((val or "UNKNOWN").upper(), 5)
 
-        for cid, data in sorted(summary["details"]["checkov_by_id"].items(),
+        for tid, data in sorted(summary["details"]["trivy_by_id"].items(),
                                 key=lambda kv: (sev_rank((kv[1].get("severity") or "").upper()), kv[0])):
-            name = data.get("name") or cid
+            name = data.get("name") or tid
             sev = (data.get("severity") or "").upper() or "UNKNOWN"
             occs = data.get("occurrences") or []
-            lines.append(f"**{cid} — {name}** (Severity: **{sev}**) — {len(occs)} occurrence(s)")
-            for (f, ls, le, res, guide) in occs:
+            lines.append(f"**{tid} — {name}** (Severity: **{sev}**) — {len(occs)} occurrence(s)")
+            for (target, ls, le, res, primary) in occs:
                 loc = ""
                 if ls is not None and le is not None:
                     loc = f":{ls}-{le}"
                 elif ls is not None:
                     loc = f":{ls}"
                 res_txt = f" — resource: `{res}`" if res else ""
-                guide_txt = f" — guideline: {guide}" if guide else ""
-                lines.append(f"- `{f}{loc}`{res_txt}{guide_txt}")
+                url_txt = f" — {primary}" if primary else ""
+                lines.append(f"- `{target}{loc}`{res_txt}{url_txt}")
 
-    lines.append("\n> All raw reports are saved as JSON artifacts (flake8, mypy, bandit, radon, checkov).")
+    lines.append("\n> All raw reports are saved as JSON artifacts (flake8, mypy, bandit, radon, trivy).")
 
     Path("outputs/quality_summary.md").write_text("\n".join(lines), encoding="utf-8")
 

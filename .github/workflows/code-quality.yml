@@ -2,9 +2,9 @@ name: Python Code Quality Checker
 
 on:
   pull_request:
-    branches: [ main, dev, demo ]
+    branches: [ main, dev, demo, test ]
   push:
-    branches: [ main, dev, demo ]
+    branches: [ main, dev, demo, test ]
 
 permissions:
   contents: read
@@ -20,7 +20,7 @@ env:
   QUALITY_THRESHOLD: "35"
   # FAIL_ON_SYNTAX_ERROR: "true"
   # PSRULE_HIGH_WEIGHT: "8"
-  CHECKOV_WEIGHT: "3"
+  TRIVY_WEIGHT: "3"
 
 jobs:
   python_quality:
@@ -85,45 +85,104 @@ jobs:
           path: outputs
 
 
-  checkov:
-    name: IaC security (Checkov) → outputs/checkov.json + SARIF
+  trivy:
+    name: IaC security (Trivy) → outputs/trivy.json + SARIF (+ severity tags)
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
       - name: Prepare outputs dir
         run: mkdir -p outputs
 
-      - name: Run checkov
-        id: checkov
-        uses: bridgecrewio/checkov-action@v12
-        continue-on-error: true
+      # Generate SARIF for GitHub Code Scanning
+      - name: Run Trivy (IaC/config) → SARIF
+        uses: aquasecurity/trivy-action@0.33.1
         with:
-          directory: .
-          quiet: true
-          framework: terraform,cloudformation,kubernetes,arm,helm,serverless
-          soft_fail: false
-          output_format: sarif,json
-          output_file_path: outputs/checkov.sarif,outputs/checkov.json
+          scan-type: 'config'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'outputs/trivy.sarif'
+          # Keep this non-fatal here; final gating is done by aggregate_score
+          exit-code: '0'
+
+      # Generate JSON for aggregation/custom reporting
+      - name: Run Trivy (IaC/config) → JSON
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          format: 'json'
+          output: 'outputs/trivy.json'
+          exit-code: '0'
+
+      - name: Build severity-tagged report (Markdown + counts)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Create a severity count JSON from Misconfigurations
+          # (Trivy JSON includes "Severity" on each misconfiguration item.)
+          jq -r '
+            [
+              .Results[]? | .Misconfigurations[]? | .Severity
+            ]
+            | map(select(. != null))
+            | group_by(.)
+            | map({ (.[0]): length })
+            | add
+          ' outputs/trivy.json > outputs/trivy_severity_counts.json || echo "{}" > outputs/trivy_severity_counts.json
+
+          # Create a severity-tagged Markdown list for easy review
+          {
+            echo "## Trivy findings (severity-tagged)"
+            echo ""
+            echo "**Severity counts:**"
+            echo ""
+            echo '```json'
+            cat outputs/trivy_severity_counts.json
+            echo '```'
+            echo ""
+            echo "**Findings:**"
+            echo ""
+            jq -r '
+              .Results[]? as $r
+              | ($r.Target // "unknown") as $target
+              | ($r.Misconfigurations // [])[]
+              | "- **[" + (.Severity // "UNKNOWN") + "]** `" + (.ID // "N/A") + "` " +
+                (.Title // "Untitled") +
+                " — **Target:** " + $target +
+                (if .CauseMetadata? and (.CauseMetadata.StartLine? != null)
+                 then " — **Line:** " + (.CauseMetadata.StartLine|tostring)
+                 else ""
+                 end) +
+                (if .PrimaryURL? then " — " + .PrimaryURL else "" end)
+            ' outputs/trivy.json || true
+          } > outputs/trivy_findings.md
+
+          # Also add this to the GitHub Actions job summary
+          cat outputs/trivy_findings.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload SARIF to code scanning
         if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: outputs/checkov.sarif
+          sarif_file: outputs/trivy.sarif
 
-      - name: Upload Checkov outputs
+      - name: Upload Trivy outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: checkov_outputs
+          name: trivy_outputs
           path: outputs
+
 
   aggregate_score:
     name: Aggregate → single JSON + Markdown, score & notify
     runs-on: ubuntu-latest
     if: always()
-    needs: [python_quality, checkov]
+    needs: [python_quality, trivy]
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -134,11 +193,11 @@ jobs:
           name: python_outputs
           path: artifacts/python
 
-      - name: Download Checkov outputs
+      - name: Download Trivy outputs
         uses: actions/download-artifact@v4
         with:
-          name: checkov_outputs
-          path: artifacts/checkov
+          name: trivy_outputs
+          path: artifacts/trivy
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -150,9 +209,7 @@ jobs:
         uses: ./.github/actions
         with:
           QUALITY_THRESHOLD: ${{ env.QUALITY_THRESHOLD }}
-          # FAIL_ON_SYNTAX_ERROR: ${{ env.FAIL_ON_SYNTAX_ERROR }}
-          # PSRULE_HIGH_WEIGHT: ${{ env.PSRULE_HIGH_WEIGHT }}
-          CHECKOV_WEIGHT: ${{ env.CHECKOV_WEIGHT }}
+          TRIVY_WEIGHT: ${{ env.TRIVY_WEIGHT }}
 
       - name: Upload aggregated summary
         uses: actions/upload-artifact@v4

@@ -1,5 +1,5 @@
 name: "Quality aggregate & score"
-description: "Aggregates tool outputs (flake8, mypy, bandit, radon, Checkov) into JSON/Markdown and exposes pass/fail."
+description: "Aggregates tool outputs (flake8, mypy, bandit, radon, Trivy) into JSON/Markdown and exposes pass/fail."
 author: "Ashutosh"
 
 inputs:
@@ -7,16 +7,15 @@ inputs:
     description: "Minimum score to pass"
     default: "35"
     required: false
-  # FAIL_ON_SYNTAX_ERROR:
-  #   description: "Hard-fail (score=0) if syntax compile failed"
-  #   default: "true"
-  #   required: false
-  # PSRULE_HIGH_WEIGHT:
-  #   description: "Weight per PSRule ERROR-level finding"
-  #   default: "8"
-  #   required: false
+
+  TRIVY_WEIGHT:
+    description: "Weight per Trivy finding"
+    default: "3"
+    required: false
+
+  # Backward-compatibility (deprecated):
   CHECKOV_WEIGHT:
-    description: "Weight per Checkov finding"
+    description: "DEPRECATED: Use TRIVY_WEIGHT instead."
     default: "3"
     required: false
 
@@ -39,8 +38,9 @@ runs:
       shell: bash
       env:
         QUALITY_THRESHOLD: ${{ inputs.QUALITY_THRESHOLD }}
-        # FAIL_ON_SYNTAX_ERROR: ${{ inputs.FAIL_ON_SYNTAX_ERROR }}
-        # PSRULE_HIGH_WEIGHT: ${{ inputs.PSRULE_HIGH_WEIGHT }}
+
+        # Prefer TRIVY_WEIGHT; keep CHECKOV_WEIGHT for legacy callers
+        TRIVY_WEIGHT: ${{ inputs.TRIVY_WEIGHT }}
         CHECKOV_WEIGHT: ${{ inputs.CHECKOV_WEIGHT }}
       run: |
         mkdir -p outputs
