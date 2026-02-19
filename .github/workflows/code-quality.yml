@@ -116,54 +116,6 @@ jobs:
           output: 'outputs/trivy.json'
           exit-code: '0'
 
-      - name: Build severity-tagged report (Markdown + counts)
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # Create a severity count JSON from Misconfigurations
-          # (Trivy JSON includes "Severity" on each misconfiguration item.)
-          jq -r '
-            [
-              .Results[]? | .Misconfigurations[]? | .Severity
-            ]
-            | map(select(. != null))
-            | group_by(.)
-            | map({ (.[0]): length })
-            | add
-          ' outputs/trivy.json > outputs/trivy_severity_counts.json || echo "{}" > outputs/trivy_severity_counts.json
-
-          # Create a severity-tagged Markdown list for easy review
-          {
-            echo "## Trivy findings (severity-tagged)"
-            echo ""
-            echo "**Severity counts:**"
-            echo ""
-            echo '```json'
-            cat outputs/trivy_severity_counts.json
-            echo '```'
-            echo ""
-            echo "**Findings:**"
-            echo ""
-            jq -r '
-              .Results[]? as $r
-              | ($r.Target // "unknown") as $target
-              | ($r.Misconfigurations // [])[]
-              | "- **[" + (.Severity // "UNKNOWN") + "]** `" + (.ID // "N/A") + "` " +
-                (.Title // "Untitled") +
-                " — **Target:** " + $target +
-                (if .CauseMetadata? and (.CauseMetadata.StartLine? != null)
-                 then " — **Line:** " + (.CauseMetadata.StartLine|tostring)
-                 else ""
-                 end) +
-                (if .PrimaryURL? then " — " + .PrimaryURL else "" end)
-            ' outputs/trivy.json || true
-          } > outputs/trivy_findings.md
-
-          # Also add this to the GitHub Actions job summary
-          cat outputs/trivy_findings.md >> "$GITHUB_STEP_SUMMARY"
-
       - name: Upload SARIF to code scanning
         if: always()
         uses: github/codeql-action/upload-sarif@v3
