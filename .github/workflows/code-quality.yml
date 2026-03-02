@@ -10,7 +10,6 @@ permissions:
   contents: read
   actions: read
   security-events: write
-  # pull-requests: write  # Not required for Jira creation; enable only if you comment on PRs
 
 concurrency:
   group: python-quality-${{ github.ref }}
@@ -26,8 +25,8 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
+          cache: "pip"
 
       - name: Install tools
         run: |
@@ -80,7 +79,7 @@ jobs:
 
 
   trivy:
-    name: IaC security (Trivy) → outputs/trivy.json + SARIF
+    name: IaC security (Trivy container) → outputs/trivy.json + SARIF
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -89,23 +88,29 @@ jobs:
       - name: Prepare outputs dir
         run: mkdir -p outputs
 
-      - name: Run Trivy (IaC/config) → SARIF
-        uses: aquasecurity/trivy-action@0.33.1
-        with:
-          scan-type: 'config'
-          scan-ref: '.'
-          format: 'sarif'
-          output: 'outputs/trivy.sarif'
-          exit-code: '0'
+      # Trivy via official container image (avoids GitHub release binary install issues)
+      # Pin a version you trust; update as needed.
+      - name: Run Trivy (IaC/config) → SARIF (container)
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            aquasec/trivy:0.69.2 \
+            config . \
+            --format sarif \
+            --output outputs/trivy.sarif \
+            --exit-code 0
 
-      - name: Run Trivy (IaC/config) → JSON
-        uses: aquasecurity/trivy-action@0.33.1
-        with:
-          scan-type: 'config'
-          scan-ref: '.'
-          format: 'json'
-          output: 'outputs/trivy.json'
-          exit-code: '0'
+      - name: Run Trivy (IaC/config) → JSON (container)
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            aquasec/trivy:0.69.2 \
+            config . \
+            --format json \
+            --output outputs/trivy.json \
+            --exit-code 0
 
       - name: Upload SARIF to code scanning
         if: always()
@@ -137,7 +142,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Create Jira issues (Summary=Trivy Title, Description=PrimaryURL)
         env:
@@ -149,14 +154,14 @@ jobs:
           # Prefer Jira Data Center PAT
           JIRA_PAT: ${{ secrets.JIRA_PAT }}
 
-          # Optional Jira Cloud fallback
+          # Optional Jira Cloud fallback (if you are on Jira Cloud instead)
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
         run: |
           python - <<'PY'
           import os, json, base64, urllib.request, urllib.parse
 
-          # --- Locate Trivy JSON (artifact path can differ depending on upload layout) ---
+          # --- Locate Trivy JSON (downloaded artifact path can vary) ---
           candidates = [
             "artifacts/trivy/trivy.json",
             "artifacts/trivy/outputs/trivy.json",
@@ -219,10 +224,9 @@ jobs:
             print("No CRITICAL/HIGH misconfigurations found; no Jira tickets created.")
             raise SystemExit(0)
 
-          # --- Optional: dedupe to avoid duplicates across re-runs ---
-          # Uses exact Title + ID in JQL so same issue isn't created repeatedly.
+          # --- Dedupe (optional but recommended) ---
+          # Avoid re-creating same finding across workflow reruns.
           def exists(title, fid):
-            # Escape quotes for JQL
             t = title.replace('"', '\\"')
             jql = f'project = "{project_key}" AND summary ~ "\\"{t}\\"" AND summary ~ "{fid}" AND statusCategory != Done'
             url = search_endpoint + "?" + urllib.parse.urlencode({"jql": jql, "maxResults": 1})
@@ -233,19 +237,19 @@ jobs:
           skipped = 0
 
           for fnd in findings:
-            # Task name as requested: use Trivy issue title (plus ID/severity to make it unique/useful)
-            summary = f"{fnd['title']} [{fnd['severity']}] ({fnd['id']})"
+            # Task name as you requested: Trivy issue title (fallback to ID)
+            summary = fnd["title"] if fnd["title"] else fnd["id"]
 
-            # Description as requested: use hyperlink / PrimaryURL
+            # Description as you requested: hyperlink/PrimaryURL
             description_text = fnd["primary"] or f"Trivy finding {fnd['id']} ({fnd['severity']}) has no PrimaryURL."
 
-            if exists(fnd["title"], fnd["id"]):
-              print(f"Skip (already exists): {summary}")
+            if exists(summary, fnd["id"]):
+              print(f"Skip (already exists): {summary} ({fnd['id']})")
               skipped += 1
               continue
 
-            # Jira Cloud uses Atlassian Document Format for textarea fields; DC accepts plain string.
             if is_cloud:
+              # Jira Cloud uses Atlassian Document Format for textarea fields
               payload = {
                 "fields": {
                   "project": {"key": project_key},
@@ -261,6 +265,7 @@ jobs:
                 }
               }
             else:
+              # Jira Server/DC generally accepts plain string description
               payload = {
                 "fields": {
                   "project": {"key": project_key},
