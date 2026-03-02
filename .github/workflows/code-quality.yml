@@ -108,7 +108,7 @@ jobs:
 
   jira_create_or_update_tickets:
     name: Jira upsert for Trivy CRITICAL/HIGH (runs on all commits)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, jira]
     needs: [trivy]
     if: ${{ always() }}
     steps:
