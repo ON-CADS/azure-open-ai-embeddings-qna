@@ -112,11 +112,11 @@ jobs:
             --output outputs/trivy.json \
             --exit-code 0
 
-      - name: Upload SARIF to code scanning
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: outputs/trivy.sarif
+      # - name: Upload SARIF to code scanning
+      #   if: always()
+      #   uses: github/codeql-action/upload-sarif@v3
+      #   with:
+      #     sarif_file: outputs/trivy.sarif
 
       - name: Upload Trivy outputs
         if: always()
