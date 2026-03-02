@@ -10,13 +10,11 @@ permissions:
   contents: read
   actions: read
   security-events: write
+  # pull-requests: write  # Not required for Jira creation; enable only if you comment on PRs
 
 concurrency:
   group: python-quality-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  TRIVY_WEIGHT: "3"
 
 jobs:
   python_quality:
@@ -24,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -123,155 +122,157 @@ jobs:
 
 
   jira_create_tickets:
-  name: Create Jira tickets for Trivy CRITICAL/HIGH
-  runs-on: ubuntu-latest
-  needs: [trivy]
-  if: ${{ always() && github.event_name == 'pull_request' }}
-  steps:
-    - name: Download Trivy outputs
-      uses: actions/download-artifact@v4
-      with:
-        name: trivy_outputs
-        path: artifacts/trivy
+    name: Create Jira tickets for Trivy CRITICAL/HIGH
+    runs-on: ubuntu-latest
+    needs: [trivy]
+    # Recommended: only create tickets on PRs to avoid duplicates on every push
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    steps:
+      - name: Download Trivy outputs
+        uses: actions/download-artifact@v4
+        with:
+          name: trivy_outputs
+          path: artifacts/trivy
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-    - name: Create Jira issues (Title as Summary, PrimaryURL as Description)
-      env:
-        JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
-        JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
-        JIRA_ISSUE_TYPE: ${{ secrets.JIRA_ISSUE_TYPE }}
+      - name: Create Jira issues (Summary=Trivy Title, Description=PrimaryURL)
+        env:
+          # Jira config
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+          JIRA_ISSUE_TYPE: ${{ secrets.JIRA_ISSUE_TYPE }}
 
-        # Prefer Data Center PAT
-        JIRA_PAT: ${{ secrets.JIRA_PAT }}
+          # Prefer Jira Data Center PAT
+          JIRA_PAT: ${{ secrets.JIRA_PAT }}
 
-        # Optional Cloud fallback
-        JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-        JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-      run: |
-        python - <<'PY'
-        import os, json, base64, urllib.request, urllib.parse
+          # Optional Jira Cloud fallback
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os, json, base64, urllib.request, urllib.parse
 
-        # Locate Trivy JSON
-        candidates = [
-          "artifacts/trivy/trivy.json",
-          "artifacts/trivy/outputs/trivy.json",
-        ]
-        trivy_path = next((p for p in candidates if os.path.exists(p)), None)
-        if not trivy_path:
-          raise SystemExit("trivy.json not found in downloaded artifact.")
+          # --- Locate Trivy JSON (artifact path can differ depending on upload layout) ---
+          candidates = [
+            "artifacts/trivy/trivy.json",
+            "artifacts/trivy/outputs/trivy.json",
+          ]
+          trivy_path = next((p for p in candidates if os.path.exists(p)), None)
+          if not trivy_path:
+            raise SystemExit("trivy.json not found in downloaded artifact.")
 
-        base_url = os.environ["JIRA_BASE_URL"].rstrip("/")
-        project_key = os.environ["JIRA_PROJECT_KEY"]
-        issue_type = os.environ.get("JIRA_ISSUE_TYPE", "Task")
+          base_url = os.environ["JIRA_BASE_URL"].rstrip("/")
+          project_key = os.environ["JIRA_PROJECT_KEY"]
+          issue_type = os.environ.get("JIRA_ISSUE_TYPE", "Task")
 
-        email = os.environ.get("JIRA_EMAIL")
-        api_token = os.environ.get("JIRA_API_TOKEN")
-        pat = os.environ.get("JIRA_PAT")
+          email = os.environ.get("JIRA_EMAIL")
+          api_token = os.environ.get("JIRA_API_TOKEN")
+          pat = os.environ.get("JIRA_PAT")
 
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+          headers = {"Accept": "application/json", "Content-Type": "application/json"}
 
-        # Auth selection: PAT (DC) preferred; else Cloud Basic
-        if pat:
-          headers["Authorization"] = f"Bearer {pat}"
-          issue_endpoint = f"{base_url}/rest/api/2/issue"
-          search_endpoint = f"{base_url}/rest/api/2/search"
-          is_cloud = False
-        elif email and api_token:
-          token = base64.b64encode(f"{email}:{api_token}".encode()).decode()
-          headers["Authorization"] = f"Basic {token}"
-          issue_endpoint = f"{base_url}/rest/api/3/issue"
-          search_endpoint = f"{base_url}/rest/api/3/search"
-          is_cloud = True
-        else:
-          raise SystemExit("Missing Jira auth. Provide JIRA_PAT (DC) or JIRA_EMAIL+JIRA_API_TOKEN (Cloud).")
-
-        def http_json(url, method="GET", payload=None):
-          data = None if payload is None else json.dumps(payload).encode("utf-8")
-          req = urllib.request.Request(url, data=data, method=method, headers=headers)
-          with urllib.request.urlopen(req) as resp:
-            body = resp.read().decode("utf-8")
-            return resp.status, (json.loads(body) if body.strip() else {})
-
-        # Load Trivy results
-        with open(trivy_path, "r", encoding="utf-8") as f:
-          trivy = json.load(f)
-
-        wanted = {"CRITICAL", "HIGH"}
-        results = trivy.get("Results", []) if isinstance(trivy, dict) else []
-
-        findings = []
-        for r in results:
-          for mc in (r.get("Misconfigurations") or []):
-            sev = str(mc.get("Severity", "")).upper()
-            if sev not in wanted:
-              continue
-            fid = mc.get("ID") or "TRIVY_UNKNOWN"
-            title = (mc.get("Title") or fid).strip()
-            primary = (mc.get("PrimaryURL") or "").strip()
-
-            findings.append({
-              "id": fid,
-              "title": title,
-              "severity": sev,
-              "primary": primary,
-            })
-
-        if not findings:
-          print("No CRITICAL/HIGH misconfigurations found; no Jira tickets created.")
-          raise SystemExit(0)
-
-        # Dedupe helper (optional): skip if same summary exists and not Done
-        def exists(summary):
-          jql = f'project = "{project_key}" AND summary ~ "{summary}" AND statusCategory != Done'
-          url = search_endpoint + "?" + urllib.parse.urlencode({"jql": jql, "maxResults": 1})
-          _, data = http_json(url, "GET")
-          return int(data.get("total", 0) or 0) > 0
-
-        created = 0
-        skipped = 0
-
-        for fnd in findings:
-          summary = fnd["title"]  # EXACTLY as you requested: title as task name
-          description_text = fnd["primary"] or f"Trivy finding {fnd['id']} ({fnd['severity']}) has no PrimaryURL."
-
-          if exists(summary):
-            print(f"Skip (already exists): {summary}")
-            skipped += 1
-            continue
-
-          # Cloud prefers ADF description; DC can accept plain string
-          if is_cloud:
-            payload = {
-              "fields": {
-                "project": {"key": project_key},
-                "issuetype": {"name": issue_type},
-                "summary": summary,
-                "description": {
-                  "type": "doc",
-                  "version": 1,
-                  "content": [
-                    {"type": "paragraph", "content": [{"type": "text", "text": description_text}]}
-                  ]
-                },
-              }
-            }
+          # --- Auth selection: PAT (Data Center) preferred; else Cloud Basic ---
+          if pat:
+            headers["Authorization"] = f"Bearer {pat}"
+            issue_endpoint = f"{base_url}/rest/api/2/issue"
+            search_endpoint = f"{base_url}/rest/api/2/search"
+            is_cloud = False
+          elif email and api_token:
+            token = base64.b64encode(f"{email}:{api_token}".encode("utf-8")).decode("ascii")
+            headers["Authorization"] = f"Basic {token}"
+            issue_endpoint = f"{base_url}/rest/api/3/issue"
+            search_endpoint = f"{base_url}/rest/api/3/search"
+            is_cloud = True
           else:
-            payload = {
-              "fields": {
-                "project": {"key": project_key},
-                "issuetype": {"name": issue_type},
-                "summary": summary,
-                "description": description_text,
+            raise SystemExit("Missing Jira auth. Provide JIRA_PAT (Data Center) or JIRA_EMAIL+JIRA_API_TOKEN (Cloud).")
+
+          def http_json(url, method="GET", payload=None):
+            data = None if payload is None else json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(url, data=data, method=method, headers=headers)
+            with urllib.request.urlopen(req) as resp:
+              body = resp.read().decode("utf-8")
+              return resp.status, (json.loads(body) if body.strip() else {})
+
+          # --- Load Trivy results ---
+          with open(trivy_path, "r", encoding="utf-8") as f:
+            trivy = json.load(f)
+
+          wanted = {"CRITICAL", "HIGH"}
+          results = trivy.get("Results", []) if isinstance(trivy, dict) else []
+
+          findings = []
+          for r in results:
+            for mc in (r.get("Misconfigurations") or []):
+              sev = str(mc.get("Severity", "")).upper()
+              if sev not in wanted:
+                continue
+              fid = mc.get("ID") or "TRIVY_UNKNOWN"
+              title = (mc.get("Title") or fid).strip()
+              primary = (mc.get("PrimaryURL") or "").strip()
+              findings.append({"id": fid, "title": title, "severity": sev, "primary": primary})
+
+          if not findings:
+            print("No CRITICAL/HIGH misconfigurations found; no Jira tickets created.")
+            raise SystemExit(0)
+
+          # --- Optional: dedupe to avoid duplicates across re-runs ---
+          # Uses exact Title + ID in JQL so same issue isn't created repeatedly.
+          def exists(title, fid):
+            # Escape quotes for JQL
+            t = title.replace('"', '\\"')
+            jql = f'project = "{project_key}" AND summary ~ "\\"{t}\\"" AND summary ~ "{fid}" AND statusCategory != Done'
+            url = search_endpoint + "?" + urllib.parse.urlencode({"jql": jql, "maxResults": 1})
+            _, data = http_json(url, "GET")
+            return int(data.get("total", 0) or 0) > 0
+
+          created = 0
+          skipped = 0
+
+          for fnd in findings:
+            # Task name as requested: use Trivy issue title (plus ID/severity to make it unique/useful)
+            summary = f"{fnd['title']} [{fnd['severity']}] ({fnd['id']})"
+
+            # Description as requested: use hyperlink / PrimaryURL
+            description_text = fnd["primary"] or f"Trivy finding {fnd['id']} ({fnd['severity']}) has no PrimaryURL."
+
+            if exists(fnd["title"], fnd["id"]):
+              print(f"Skip (already exists): {summary}")
+              skipped += 1
+              continue
+
+            # Jira Cloud uses Atlassian Document Format for textarea fields; DC accepts plain string.
+            if is_cloud:
+              payload = {
+                "fields": {
+                  "project": {"key": project_key},
+                  "issuetype": {"name": issue_type},
+                  "summary": summary,
+                  "description": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [
+                      {"type": "paragraph", "content": [{"type": "text", "text": description_text}]}
+                    ],
+                  },
+                }
               }
-            }
+            else:
+              payload = {
+                "fields": {
+                  "project": {"key": project_key},
+                  "issuetype": {"name": issue_type},
+                  "summary": summary,
+                  "description": description_text,
+                }
+              }
 
-          _, data = http_json(issue_endpoint, "POST", payload)
-          print("Created:", data.get("key", "(unknown)"), "-", summary)
-          created += 1
+            _, data = http_json(issue_endpoint, "POST", payload)
+            print("Created:", data.get("key", "(unknown)"), "-", summary)
+            created += 1
 
-        print(f"Done. Created={created}, Skipped={skipped}, Total={len(findings)}")
-        PY
+          print(f"Done. Created={created}, Skipped={skipped}, TotalCandidates={len(findings)}")
+          PY
